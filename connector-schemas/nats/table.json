@@ -16,7 +16,7 @@
             "type": "string",
             "description": "The subject of the NATS message",
             "examples": [
-                "orders.uniswapv3-polygon.spot.MECHA.USDC.flowdesk.uniswapv3-polygon-spot-0"
+                "my-subject"
             ]
         },
         "token": {
