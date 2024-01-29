@@ -1,14 +1,16 @@
+use crate::engine::Context;
+use crate::{RateLimiter, SourceFinishType};
 use arroyo_formats::{DataDeserializer, SchemaData};
 use arroyo_macro::{source_fn, StreamNode};
 use arroyo_rpc::formats::BadData;
-use arroyo_rpc::grpc::TableDescriptor;
+use arroyo_rpc::grpc::{TableDescriptor, StopMode};
+use arroyo_rpc::ControlResp;
 use arroyo_rpc::OperatorConfig;
+use arroyo_rpc::ControlMessage;
 use arroyo_state::tables::global_keyed_map::GlobalKeyedState;
 use arroyo_types::UserError;
 use async_nats;
 use bincode::{Decode, Encode};
-use crate::{RateLimiter, SourceFinishType};
-use crate::engine::Context;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
@@ -93,7 +95,15 @@ where
         match self.run_int(ctx).await {
             Ok(r) => r,
             Err(e) => {
-                ctx.report_error(e.name.clone(), e.details.clone()).await;
+                ctx.control_tx
+                    .send(ControlResp::Error {
+                        operator_id: ctx.task_info.operator_id.clone(),
+                        task_index: ctx.task_info.task_index,
+                        message: e.name.clone(),
+                        details: e.details.clone(),
+                    })
+                    .await
+                    .unwrap();
                 panic!("{}: {}", e.name, e.details);
             }
         }
@@ -130,15 +140,45 @@ where
                         },
                     }
                 }
-                // TODO: Implement checkpointing here
-                // control_message = ctx.control_rx.recv() => {
-                //     match control_message {
-                //         Some(msg) => {
-                //         },
-                //         None => {
-                //         }
-                //     }
-                // }
+                control_message = ctx.control_rx.recv() => {
+                    match control_message {
+                        Some(ControlMessage::Checkpoint(c)) => {
+                            debug!("Starting checkpointing {}", ctx.task_info.task_index);
+                            // let mut s = ctx.state.get_global_keyed_state('k').await;
+                            
+                            // TODO: Implement checkpointing here. In Kafka, checkpointing is handled
+                            // via messages offsets in their respective partitions to guarantee exactly
+                            // once semantics. In NATS, messages are published to subjects (topics), 
+                            // and subscribers can receive messages from those subjects. NATS doesn't 
+                            // maintain offsets or partitions for subscribers because it focuses on 
+                            // simple, lightweight, and real-time message distribution.
+
+                            if self.checkpoint(c, ctx).await {
+                                return Ok(SourceFinishType::Immediate);
+                            }
+                        }
+                        Some(ControlMessage::Stop { mode }) => {
+                            info!("Stopping NATS source: {:?}", mode);
+                            match mode {
+                                StopMode::Graceful => {
+                                    return Ok(SourceFinishType::Graceful);
+                                }
+                                StopMode::Immediate => {
+                                    return Ok(SourceFinishType::Immediate);
+                                }
+                            }
+                        }
+                        Some(ControlMessage::Commit { .. }) => {
+                            unreachable!("Sources shouldn't receive commit messages");
+                        }
+                        Some(ControlMessage::LoadCompacted {compacted}) => {
+                            ctx.load_compacted(compacted).await;
+                        }
+                        Some(ControlMessage::NoOp) => {}
+                        None => {
+                        }
+                    }
+                }
             }
         }
         Ok(SourceFinishType::Graceful)
