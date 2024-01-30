@@ -73,7 +73,7 @@ const GCS_VIRTUAL: &str =
 // https://storage.googleapis.com/BUCKET_NAME/OBJECT_NAME
 const GCS_PATH: &str =
     r"^https://storage\.googleapis\.com/(?P<bucket>[a-z\d\-_\.]+)(/(?P<key>.+))?$";
-const GCS_URL: &str = r"^[gG][sS]://(?P<bucket>[a-z0-9\-\.]+)(/(?P<key>.+))?$";
+const GCS_URL: &str = r"^[gG][sS]://(?P<bucket>[a-z0-9\-_\.]+)(/(?P<key>.+))?$";
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Copy)]
 enum Backend {
