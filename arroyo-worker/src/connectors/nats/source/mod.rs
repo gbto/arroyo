@@ -20,10 +20,7 @@ use tracing::debug;
 use tracing::info;
 use typify::import_types;
 
-import_types!(
-    schema = "../connector-schemas/nats/table.json",
-    convert = { {type = "string", format = "var-str"} = VarStr }
-);
+import_types!(schema = "../connector-schemas/nats/table.json");
 
 // TODO: Should generic types be more specific here?
 #[derive(StreamNode)]
@@ -34,6 +31,8 @@ where
 {
     server: String,
     subject: String,
+    user: Option<String>,
+    password: Option<String>,
     deserializer: DataDeserializer<T>,
     bad_data: Option<BadData>,
     rate_limiter: RateLimiter,
@@ -70,6 +69,8 @@ where
         Self {
             server: table.server,
             subject: table.subject,
+            user: table.user,
+            password: table.password,
             deserializer: DataDeserializer::new(format, framing),
             bad_data: config.bad_data,
             rate_limiter: RateLimiter::new(),
@@ -109,12 +110,21 @@ where
         }
     }
 
+    
     async fn run_int(&mut self, ctx: &mut Context<(), T>) -> Result<SourceFinishType, UserError> {
         let nats_server = self.server.clone();
         let nats_subject = self.subject.clone();
-
-        let client = async_nats::connect(nats_server.clone()).await.unwrap();
-        let mut subscriber = client.subscribe(nats_subject.clone()).await.unwrap();
+        let mut subscriber = if self.user.is_some() && self.password.is_some() {
+            let client = async_nats::ConnectOptions::new()
+                .user_and_password(self.user.clone().unwrap(), self.password.clone().unwrap())
+                .connect(nats_server.clone())
+                .await
+                .unwrap();
+            client.subscribe(nats_subject.clone()).await.unwrap()
+        } else {
+            let client: async_nats::Client = async_nats::connect(nats_server.clone()).await.unwrap();
+            client.subscribe(nats_subject.clone()).await.unwrap()
+        };
 
         loop {
             select! {

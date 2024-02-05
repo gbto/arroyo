@@ -9,15 +9,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use typify::import_types;
-// use arroyo_worker::connectors::nats::source::NatsSourceFunc;
 
 const TABLE_SCHEMA: &str = include_str!("../../connector-schemas/nats/table.json");
 const ICON: &str = include_str!("../resources/nats.svg");
 
-import_types!(
-    schema = "../connector-schemas/nats/table.json",
-    convert = { {type = "string", format = "var-str"} = VarStr }
-);
+// TODO: Create a separate `../connector-schemas/nats/table.json` for allowing
+// string template substitution for security reasons (cf. user/password/token)
+import_types!(schema = "../connector-schemas/nats/table.json");
 
 pub struct NatsConnector {}
 
@@ -127,6 +125,8 @@ impl Connector for NatsConnector {
     ) -> anyhow::Result<Connection> {
         let server = pull_opt("server", options)?;
         let subject = pull_opt("subject", options)?;
+        let user=  options.remove("user");
+        let password = options.remove("password");
         let token = options.remove("token");
 
         self.from_config(
@@ -136,6 +136,8 @@ impl Connector for NatsConnector {
             NatsTable {
                 server,
                 subject,
+                user,
+                password,
                 token,
             },
             schema,
