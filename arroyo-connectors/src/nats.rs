@@ -125,7 +125,9 @@ impl Connector for NatsConnector {
     ) -> anyhow::Result<Connection> {
         let server = pull_opt("server", options)?;
         let subject = pull_opt("subject", options)?;
-        let user=  options.remove("user");
+        let stream = pull_opt("stream", options)?;
+        let consumer = pull_opt("consumer", options)?;
+        let user = options.remove("user");
         let password = options.remove("password");
         let token = options.remove("token");
 
@@ -135,6 +137,8 @@ impl Connector for NatsConnector {
             EmptyConfig {},
             NatsTable {
                 server,
+                stream,
+                consumer,
                 subject,
                 user,
                 password,

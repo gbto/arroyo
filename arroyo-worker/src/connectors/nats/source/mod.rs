@@ -8,6 +8,7 @@ use arroyo_rpc::ControlMessage;
 use arroyo_rpc::ControlResp;
 use arroyo_rpc::OperatorConfig;
 use arroyo_types::UserError;
+use async_nats::jetstream::consumer;
 use bincode::{Decode, Encode};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -17,8 +18,6 @@ use tokio::select;
 use tracing::debug;
 use tracing::info;
 use typify::import_types;
-use async_nats::jetstream::consumer::push::Config;
-
 
 import_types!(schema = "../connector-schemas/nats/table.json");
 
@@ -30,6 +29,8 @@ where
     T: SchemaData,
 {
     server: String,
+    stream_name: String,
+    consumer_name: String,
     subject: String,
     user: Option<String>,
     password: Option<String>,
@@ -39,7 +40,6 @@ where
     _t: PhantomData<(K, T)>,
 }
 
-// TODO: How to handle the state of a NATS source? last_message like `polling_http`?
 #[derive(Copy, Clone, Debug, Encode, Decode, PartialEq, PartialOrd)]
 enum NatsSourceState {
     Finished,
@@ -68,6 +68,8 @@ where
 
         Self {
             server: table.server,
+            stream_name: table.stream,
+            consumer_name: table.consumer,
             subject: table.subject,
             user: table.user,
             password: table.password,
@@ -77,7 +79,7 @@ where
             _t: PhantomData,
         }
     }
-    
+
     fn name(&self) -> String {
         "NatsSource".to_string()
     }
@@ -86,18 +88,63 @@ where
         vec![arroyo_state::global_table("s", "NATS source state")]
     }
 
-    async fn get_nats_consumer(&mut self, 
-            stream_name: &str,
-            consumer_name: &str,
-        ) -> async_nats::jetstream::consumer::Consumer<Config> {
+    async fn get_nats_consumer(
+        &mut self,
+        stream_name: String,
+        consumer_name: String,
+        _ctx: &mut Context<(), T>,
+    ) -> async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>
+    {
+        info!(
+            "Instantiating NATS consumer `{}` for stream `{}`",
+            consumer_name, stream_name
+        );
         let client = async_nats::ConnectOptions::new()
             .user_and_password(self.user.clone().unwrap(), self.password.clone().unwrap())
             .connect(self.server.clone())
             .await
             .unwrap();
+
         let jetstream = async_nats::jetstream::new(client);
-        let stream = jetstream.get_stream(stream_name).await.unwrap();
-        let consumer = stream.get_consumer(consumer_name).await.unwrap();
+        let mut stream = jetstream.get_stream(&stream_name).await.unwrap();
+        let mut consumer: consumer::PullConsumer =
+            stream.get_consumer(&consumer_name).await.unwrap();
+
+        let consumer_info = consumer.info().await.unwrap();
+        let stream_info = stream.info().await.unwrap();
+
+        info!(
+            "Stream state last sequence number: {}",
+            &stream_info.state.last_sequence
+        );
+        info!(
+            "Stream state last message timestamp: {}",
+            &stream_info.state.last_timestamp
+        );
+        info!(
+            "Stream state number of messages: {}",
+            &stream_info.state.messages
+        );
+        info!(
+            "Number of pending ack messages: {}",
+            &consumer_info.num_pending
+        );
+        info!(
+            "Number of delivered messages: {}",
+            &consumer_info.num_ack_pending
+        );
+        info!(
+            "Number of waiting delivery messages: {}",
+            &consumer_info.num_waiting
+        );
+        info!(
+            "Delivered stream sequence: {}",
+            &consumer_info.delivered.stream_sequence
+        );
+        info!(
+            "Delivered consumer sequence: {}",
+            &consumer_info.delivered.consumer_sequence
+        );
         consumer
     }
 
@@ -120,12 +167,15 @@ where
     }
 
     async fn run_int(&mut self, ctx: &mut Context<(), T>) -> Result<SourceFinishType, UserError> {
-
         // TODO: Add stream and consumer name as configuration options
-        let consumer = self.get_nats_consumer(
-            "balances-demo",
-            "balances-demo-push",
-        ).await;
+        let consumer = self
+            .get_nats_consumer(
+                self.stream_name.to_string(),
+                self.consumer_name.to_string(),
+                ctx,
+            )
+            .await;
+
         let mut messages = consumer.messages().await.unwrap();
 
         loop {
@@ -146,6 +196,8 @@ where
                                 &self.bad_data,
                                 &mut self.rate_limiter,
                             ).await?;
+
+                            msg.ack().await.unwrap();
                         },
                         Some(Err(msg)) => {
                             return Err(UserError::new("NATS message error", msg.to_string()));

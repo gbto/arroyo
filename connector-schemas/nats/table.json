@@ -10,6 +10,22 @@
                 "nats://localhost:4222"
             ]
         },
+        "stream": {
+            "title": "Stream",
+            "type": "string",
+            "description": "The stream of the NATS message",
+            "examples": [
+                "my-stream"
+            ]
+        },
+        "consumer": {
+            "title": "Consumer",
+            "type": "string",
+            "description": "The consumer of the NATS message",
+            "examples": [
+                "my-consumer"
+            ]
+        },
         "subject": {
             "title": "Subject",
             "type": "string",
@@ -46,6 +62,8 @@
     "additionalProperties": false,
     "required": [
         "server",
-        "subject"
+        "subject",
+        "stream",
+        "consumer"
     ]
 }
