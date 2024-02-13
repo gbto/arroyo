@@ -7,13 +7,17 @@ use arroyo_rpc::grpc::{StopMode, TableDescriptor};
 use arroyo_rpc::ControlMessage;
 use arroyo_rpc::ControlResp;
 use arroyo_rpc::OperatorConfig;
+use arroyo_state::tables::global_keyed_map::GlobalKeyedState;
+use arroyo_types::Data;
 use arroyo_types::UserError;
 use async_nats::jetstream::consumer;
 use bincode::{Decode, Encode};
 use futures::StreamExt;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::select;
 use tracing::debug;
 use tracing::info;
@@ -25,13 +29,11 @@ import_types!(schema = "../connector-schemas/nats/table.json");
 #[derive(StreamNode)]
 pub struct NatsSourceFunc<K, T>
 where
-    K: Send + 'static,
-    T: SchemaData,
+    K: DeserializeOwned + Data,
+    T: SchemaData + Data,
 {
     server: String,
     stream_name: String,
-    consumer_name: String,
-    subject: String,
     user: Option<String>,
     password: Option<String>,
     deserializer: DataDeserializer<T>,
@@ -40,21 +42,21 @@ where
     _t: PhantomData<(K, T)>,
 }
 
-#[derive(Copy, Clone, Debug, Encode, Decode, PartialEq, PartialOrd)]
-enum NatsSourceState {
-    Finished,
-    RecordsRead(usize),
+#[derive(Clone, Debug, Encode, Decode, PartialEq, PartialOrd)]
+pub struct NatsSourceState {
+    stream_name: String,
+    stream_sequence_number: u64,
 }
 
 pub fn tables() -> Vec<TableDescriptor> {
-    vec![arroyo_state::global_table("f", "NATS source state")]
+    vec![arroyo_state::global_table("k", "NATS source state")]
 }
 
 #[source_fn(out_k = (), out_t = T)]
 impl<K, T> NatsSourceFunc<K, T>
 where
-    K: Send + 'static,
-    T: SchemaData,
+    K: DeserializeOwned + Data,
+    T: SchemaData + Data,
 {
     pub fn from_config(config: &str) -> Self {
         let config: OperatorConfig =
@@ -69,8 +71,6 @@ where
         Self {
             server: table.server,
             stream_name: table.stream,
-            consumer_name: table.consumer,
-            subject: table.subject,
             user: table.user,
             password: table.password,
             deserializer: DataDeserializer::new(format, framing),
@@ -85,20 +85,13 @@ where
     }
 
     pub fn tables(&self) -> Vec<arroyo_rpc::grpc::TableDescriptor> {
-        vec![arroyo_state::global_table("s", "NATS source state")]
+        vec![arroyo_state::global_table("k", "NATS source state")]
     }
 
-    async fn get_nats_consumer(
+    async fn get_nats_stream(
         &mut self,
         stream_name: String,
-        consumer_name: String,
-        _ctx: &mut Context<(), T>,
-    ) -> async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>
-    {
-        info!(
-            "Instantiating NATS consumer `{}` for stream `{}`",
-            consumer_name, stream_name
-        );
+    ) -> async_nats::jetstream::stream::Stream {
         let client = async_nats::ConnectOptions::new()
             .user_and_password(self.user.clone().unwrap(), self.password.clone().unwrap())
             .connect(self.server.clone())
@@ -107,44 +100,121 @@ where
 
         let jetstream = async_nats::jetstream::new(client);
         let mut stream = jetstream.get_stream(&stream_name).await.unwrap();
-        let mut consumer: consumer::PullConsumer =
-            stream.get_consumer(&consumer_name).await.unwrap();
 
-        let consumer_info = consumer.info().await.unwrap();
         let stream_info = stream.info().await.unwrap();
-
+        info!("<---------------------------------------------->");
+        info!("Stream - timestamp of creation: {}", &stream_info.created);
         info!(
-            "Stream state last sequence number: {}",
+            "Stream - lowest sequence number still present: {}",
+            &stream_info.state.first_sequence
+        );
+        info!(
+            "Stream - last sequence number assigned to a message: {}",
             &stream_info.state.last_sequence
         );
         info!(
-            "Stream state last message timestamp: {}",
+            "Stream - time that the last message was received: {}",
             &stream_info.state.last_timestamp
         );
         info!(
-            "Stream state number of messages: {}",
+            "Stream - number of messages contained: {}",
             &stream_info.state.messages
         );
         info!(
-            "Number of pending ack messages: {}",
-            &consumer_info.num_pending
+            "Stream - number of bytes contained: {}",
+            &stream_info.state.bytes
         );
         info!(
-            "Number of delivered messages: {}",
+            "Stream - number of consumers: {}",
+            &stream_info.state.consumer_count
+        );
+        stream
+    }
+
+    async fn get_nats_consumer(
+        &mut self,
+        stream: &async_nats::jetstream::stream::Stream,
+        ctx: &mut Context<(), T>,
+    ) -> consumer::Consumer<consumer::pull::Config> {
+        // Get the last valid state from the checkpoints
+        let mut s: GlobalKeyedState<String, NatsSourceState, _> =
+            ctx.state.get_global_keyed_state('k').await;
+
+        let state: Vec<&NatsSourceState> = s.get_all();
+        let sequence = if !state.is_empty() {
+            info!("Found state for NATS source");
+            let max_sequence_number = state
+                .iter()
+                .max_by_key(|state| state.stream_sequence_number)
+                .map(|state| state.stream_sequence_number)
+                .unwrap();
+            info!("Starting from sequence number: {}", max_sequence_number + 1);
+            max_sequence_number
+        } else {
+            info!("No state found for NATS source. All stream messages will be processed.");
+            info!("Starting from sequence number: 1");
+            1
+        };
+        // Configure the delivery policy that will define where the consumer will start
+        let deliver_policy = {
+            if sequence == 0 {
+                consumer::DeliverPolicy::All
+            } else {
+                consumer::DeliverPolicy::ByStartSequence {
+                    start_sequence: sequence + 1,
+                }
+            }
+        };
+        // Define the consumer configuration
+        let consumer_config = consumer::pull::Config {
+            name: Some(self.stream_name.to_string()),
+            ack_policy: consumer::AckPolicy::Explicit,
+            replay_policy: consumer::ReplayPolicy::Instant,
+            inactive_threshold: Duration::from_secs(60),
+            ack_wait: Duration::from_secs(60),
+            num_replicas: 1,
+            deliver_policy,
+            ..Default::default()
+        };
+        match stream.delete_consumer(&self.stream_name).await {
+            Ok(_) => {
+                info!("Existing consumer deleted. Recreating consumer with new `start_sequence`.")
+            }
+            Err(_) => {
+                info!("No existing consumer found, proceeding with the creation of a new one.")
+            }
+        }
+        let mut consumer = stream
+            .create_consumer(consumer_config.clone())
+            .await
+            .unwrap();
+
+        let consumer_info = consumer.info().await.unwrap();
+        info!(
+            "Consumer - timestamp of creation: {}",
+            &consumer_info.created
+        );
+        info!(
+            "Consumer - last stream sequence of aknowledged messagee: {}",
+            &consumer_info.ack_floor.stream_sequence
+        );
+        info!(
+            "Consumer - last consumer sequence of aknowledged message: {}",
+            &consumer_info.ack_floor.consumer_sequence
+        );
+        info!(
+            "Consumer delivered messages: {}",
             &consumer_info.num_ack_pending
         );
         info!(
-            "Number of waiting delivery messages: {}",
+            "Consumer pending ack messages: {}",
+            &consumer_info.num_pending
+        );
+        info!(
+            "Consumer waiting delivery messages: {}",
             &consumer_info.num_waiting
         );
-        info!(
-            "Delivered stream sequence: {}",
-            &consumer_info.delivered.stream_sequence
-        );
-        info!(
-            "Delivered consumer sequence: {}",
-            &consumer_info.delivered.consumer_sequence
-        );
+        info!("<--------------------------------------------->");
         consumer
     }
 
@@ -167,15 +237,10 @@ where
     }
 
     async fn run_int(&mut self, ctx: &mut Context<(), T>) -> Result<SourceFinishType, UserError> {
-        // TODO: Add stream and consumer name as configuration options
-        let consumer = self
-            .get_nats_consumer(
-                self.stream_name.to_string(),
-                self.consumer_name.to_string(),
-                ctx,
-            )
-            .await;
+        let stream = self.get_nats_stream(self.stream_name.to_string()).await;
+        let consumer = self.get_nats_consumer(&stream, ctx).await;
 
+        let mut sequence: HashMap<String, NatsSourceState> = HashMap::new();
         let mut messages = consumer.messages().await.unwrap();
 
         loop {
@@ -183,12 +248,44 @@ where
                 message = messages.next() => {
                     match message {
                         Some(Ok(msg)) => {
+                            // TODO: Should another timestamp be used here?
                             let timestamp = SystemTime::now();
                             let payload = msg.payload.as_ref();
                             let message = self.deserializer.deserialize_single(&payload);
 
+                            let message_info = msg.info().unwrap();
+
+                            info!("---------------------------------------------->");
                             debug!("Message format: {:?}", self.deserializer.get_format());
                             debug!("Message payload: {:?}", message.as_ref().unwrap());
+                            info!(
+                                "Delivered stream sequence: {}",
+                                message_info.stream_sequence
+                            );
+                            info!(
+                                "Delivered consumer sequence: {}",
+                                message_info.consumer_sequence
+                            );
+                            info!(
+                                "Delivered message stream: {}",
+                                message_info.stream
+                            );
+                            info!(
+                                "Delivered message consumer: {}",
+                                message_info.consumer
+                            );
+                            info!(
+                                "Delivered message published: {}",
+                                message_info.published
+                            );
+                            info!(
+                                "Delivered message pending: {}",
+                                message_info.pending
+                            );
+                            info!(
+                                "Delivered message delivered: {}",
+                                message_info.delivered
+                            );
 
                             ctx.collect_source_record(
                                 timestamp,
@@ -197,6 +294,14 @@ where
                                 &mut self.rate_limiter,
                             ).await?;
 
+                            // Inserting the collected sequence number into the a representation
+                            // of the state that is yet to be written to the checkpoint
+                            let stream_name = message_info.consumer.to_string();
+                            let stream_sequence_number = message_info.stream_sequence.clone();
+                            sequence.insert(stream_name.clone(), NatsSourceState { stream_name, stream_sequence_number});
+
+                            // TODO: Has ACK to happens here at every message? Maybe it can be
+                            // done by ack only the last message before checkpointing
                             msg.ack().await.unwrap();
                         },
                         Some(Err(msg)) => {
@@ -204,7 +309,7 @@ where
                         },
                         None => {
                             break
-                            info!("Finished reading message from {}", &self.subject);
+                            info!("Finished reading message from {}", &self.stream_name);
                         },
                     }
                 }
@@ -212,14 +317,20 @@ where
                     match control_message {
                         Some(ControlMessage::Checkpoint(c)) => {
                             debug!("Starting checkpointing {}", ctx.task_info.task_index);
-                            // let mut s = ctx.state.get_global_keyed_state('k').await;
+                            let mut s: GlobalKeyedState<String, NatsSourceState, _> = ctx.state.get_global_keyed_state('k').await;
 
-                            // TODO: Implement checkpointing here. In Kafka, checkpointing is handled
-                            // via messages offsets in their respective partitions to guarantee exactly
-                            // once semantics. In NATS, messages are published to subjects (topics),
-                            // and subscribers can receive messages from those subjects. NATS doesn't
-                            // maintain offsets or partitions for subscribers because it focuses on
-                            // simple, lightweight, and real-time message distribution.
+                            // TODO: Can this be parallelized?
+                            for (stream_name, seq_state) in &sequence {
+                                s.insert(stream_name.to_string(), seq_state.clone()).await;
+                            }
+
+                            let max_sequence_number = sequence
+                                .iter()
+                                .map(|(_, state)| state.stream_sequence_number)
+                                .max()
+                                .unwrap();
+
+                            debug!("Checkpointed sequence number: {}", max_sequence_number);
 
                             if self.checkpoint(c, ctx).await {
                                 return Ok(SourceFinishType::Immediate);
