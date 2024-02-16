@@ -1,8 +1,8 @@
-use crate::{pull_opt, Connection, Connector, EmptyConfig};
+use crate::{pull_opt, Connection, ConnectionType, Connector, EmptyConfig};
 use anyhow::anyhow;
-use arroyo_rpc::api_types::connections::{
-    ConnectionProfile, ConnectionSchema, ConnectionType, TestSourceMessage,
-};
+use anyhow::bail;
+use arroyo_rpc::api_types::connections::{ConnectionProfile, ConnectionSchema, TestSourceMessage};
+
 use arroyo_rpc::OperatorConfig;
 use axum::response::sse::Event;
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,6 @@ pub struct NatsConnector {}
 
 impl Connector for NatsConnector {
     type ProfileT = EmptyConfig;
-
     type TableT = NatsTable;
 
     fn name(&self) -> &'static str {
@@ -45,8 +44,20 @@ impl Connector for NatsConnector {
         }
     }
 
-    fn table_type(&self, _: Self::ProfileT, _: Self::TableT) -> ConnectionType {
-        ConnectionType::Source
+    fn table_type(&self, _: Self::ProfileT, table: Self::TableT) -> ConnectionType {
+        match table.table_type {
+            TableType::Source { .. } => ConnectionType::Source,
+            TableType::Sink { .. } => ConnectionType::Sink,
+        }
+    }
+
+    fn get_schema(
+        &self,
+        _: Self::ProfileT,
+        _: Self::TableT,
+        s: Option<&ConnectionSchema>,
+    ) -> Option<ConnectionSchema> {
+        s.cloned()
     }
 
     fn test(
@@ -79,17 +90,23 @@ impl Connector for NatsConnector {
         table: Self::TableT,
         schema: Option<&ConnectionSchema>,
     ) -> anyhow::Result<Connection> {
-        let desc = format!("NatsSource<{}>", table.subject);
+        let (connection_type, operator, desc) = match table.table_type {
+            TableType::Source { .. } => (
+                ConnectionType::Source,
+                "connectors::nats::source::NatsSourceFunc",
+                format!("NatsSource<{}>", table.stream),
+            ),
+            TableType::Sink { .. } => (
+                ConnectionType::Sink,
+                "connectors::nats::sink::NatsSinkFunc::<#in_k, #in_t>",
+                format!("NatsSink<{}>", table.subject),
+            ),
+        };
 
         let schema = schema
             .map(|s| s.to_owned())
             .ok_or_else(|| anyhow!("No schema defined for NATS"))?;
 
-        // TODO: Test the config schema and return an error if it's invalid.
-        // Does it already happen somewhere else as server and subject are specified
-        // as `required` in the JSON schema?
-
-        // TODO: Where is that format coming from?
         let format = schema
             .format
             .as_ref()
@@ -108,9 +125,9 @@ impl Connector for NatsConnector {
         Ok(Connection {
             id,
             name: name.to_string(),
-            connection_type: ConnectionType::Source,
+            connection_type,
             schema,
-            operator: "connectors::nats::source::NatsSourceFunc".to_string(),
+            operator: operator.to_string(),
             config: serde_json::to_string(&config).unwrap(),
             description: desc,
         })
@@ -123,27 +140,38 @@ impl Connector for NatsConnector {
         schema: Option<&ConnectionSchema>,
         _profile: Option<&ConnectionProfile>,
     ) -> anyhow::Result<Connection> {
+        let conn_type = pull_opt("type", options)?;
         let server = pull_opt("server", options)?;
         let subject = pull_opt("subject", options)?;
         let stream = pull_opt("stream", options)?;
-        let consumer = pull_opt("consumer", options)?;
-        let user = options.remove("user");
-        let password = options.remove("password");
-        let token = options.remove("token");
 
+        let table_type = match conn_type.as_str() {
+            "source" => TableType::Source {
+                password: options.remove("source.password"),
+                token: options.remove("source.token"),
+                user: options.remove("source.user"),
+            },
+            "sink" => TableType::Sink {
+                password: options.remove("source.password"),
+                token: options.remove("source.token"),
+                user: options.remove("source.user"),
+            },
+            _ => {
+                bail!("Type must be one of 'source' or 'sink");
+            }
+        };
+
+        let table = NatsTable {
+            server,
+            subject,
+            stream,
+            table_type            
+        };
         self.from_config(
             None,
             name,
             EmptyConfig {},
-            NatsTable {
-                server,
-                stream,
-                consumer,
-                subject,
-                user,
-                password,
-                token,
-            },
+            table,
             schema,
         )
     }

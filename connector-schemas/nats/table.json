@@ -18,14 +18,6 @@
                 "my-stream"
             ]
         },
-        "consumer": {
-            "title": "Consumer",
-            "type": "string",
-            "description": "The consumer of the NATS message",
-            "examples": [
-                "my-consumer"
-            ]
-        },
         "subject": {
             "title": "Subject",
             "type": "string",
@@ -34,36 +26,77 @@
                 "my-subject"
             ]
         },
-        "user": {
-            "title": "User",
-            "type": "string",
-            "description": "Optional, the user for NATS server authentication",
-            "examples": [
-                "my-user"
-            ]
-        },
-        "password": {
-            "title": "Password",
-            "type": "string",
-            "description": "Optional, the password for NATS server authentication",
-            "examples": [
-                "my-password"
-            ]
-        },
-        "token": {
-            "title": "Token",
-            "type": "string",
-            "description": "Optional, the token for NATS server authentication",
-            "examples": [
-                "my-auth-token"
+        "table_type": {
+            "title": "Table Type",
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "title": "Source",
+                    "properties": {
+                        "user": {
+                            "title": "User",
+                            "type": "string",
+                            "description": "Optional, the user for NATS server authentication",
+                            "examples": [
+                                "my-user"
+                            ]
+                        },
+                        "password": {
+                            "title": "Password",
+                            "type": "string",
+                            "description": "Optional, the password for NATS server authentication",
+                            "examples": [
+                                "my-password"
+                            ]
+                        },
+                        "token": {
+                            "title": "Token",
+                            "type": "string",
+                            "description": "Optional, the token for NATS server authentication",
+                            "examples": [
+                                "my-auth-token"
+                            ]
+                        }
+                    }
+                },
+                {
+                    "type": "object",
+                    "title": "Sink",
+                    "properties": {
+                        "user": {
+                            "title": "User",
+                            "type": "string",
+                            "description": "Optional, the user for NATS server authentication",
+                            "examples": [
+                                "my-user"
+                            ]
+                        },
+                        "password": {
+                            "title": "Password",
+                            "type": "string",
+                            "description": "Optional, the password for NATS server authentication",
+                            "examples": [
+                                "my-password"
+                            ]
+                        },
+                        "token": {
+                            "title": "Token",
+                            "type": "string",
+                            "description": "Optional, the token for NATS server authentication",
+                            "examples": [
+                                "my-auth-token"
+                            ]
+                        }
+                    }
+                }
             ]
         }
     },
-    "additionalProperties": false,
     "required": [
         "server",
-        "subject",
         "stream",
-        "consumer"
+        "subject",
+        "table_type"
     ]
 }

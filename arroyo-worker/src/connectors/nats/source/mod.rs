@@ -1,29 +1,27 @@
-use crate::engine::Context;
-use crate::{RateLimiter, SourceFinishType};
 use arroyo_formats::{DataDeserializer, SchemaData};
 use arroyo_macro::{source_fn, StreamNode};
-use arroyo_rpc::formats::BadData;
-use arroyo_rpc::grpc::{StopMode, TableDescriptor};
 use arroyo_rpc::ControlMessage;
 use arroyo_rpc::ControlResp;
+use arroyo_rpc::formats::BadData;
+use arroyo_rpc::grpc::{StopMode, TableDescriptor};
 use arroyo_rpc::OperatorConfig;
 use arroyo_state::tables::global_keyed_map::GlobalKeyedState;
 use arroyo_types::Data;
 use arroyo_types::UserError;
 use async_nats::jetstream::consumer;
 use bincode::{Decode, Encode};
+use crate::{RateLimiter, SourceFinishType};
+use crate::engine::Context;
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::time::{Duration, SystemTime};
 use tokio::select;
 use tracing::debug;
 use tracing::info;
-use typify::import_types;
 
-import_types!(schema = "../connector-schemas/nats/table.json");
+use super::NatsTable;
 
 // TODO: Should generic types be more specific here?
 #[derive(StreamNode)]
@@ -71,8 +69,8 @@ where
         Self {
             server: table.server,
             stream_name: table.stream,
-            user: table.user,
-            password: table.password,
+            user: table.table_type.get_credentials("user"),
+            password: table.table_type.get_credentials("password"),
             deserializer: DataDeserializer::new(format, framing),
             bad_data: config.bad_data,
             rate_limiter: RateLimiter::new(),
