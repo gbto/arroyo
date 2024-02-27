@@ -3,28 +3,32 @@ use arroyo_formats::DataSerializer;
 use arroyo_formats::SchemaData;
 use arroyo_macro::process_fn;
 use arroyo_rpc::{ControlResp, OperatorConfig};
+use arroyo_rpc::ControlMessage;
 use arroyo_rpc::grpc::TableDescriptor;
 use arroyo_types::*;
+use async_nats::ServerAddr;
 use crate::engine::{Context, StreamNode};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::marker::PhantomData;
+use super::ConnectorType;
+use super::consumer_configs;
+use super::NatsConfig;
 use super::NatsTable;
-use tracing::warn;
-use arroyo_rpc::ControlMessage;
 use tracing::info;
+use tracing::warn;
 
 #[derive(StreamNode)]
-pub struct NatsSinkFunc<K: Key + Serialize, T: SchemaData>  {
+pub struct NatsSinkFunc<K: Key + Serialize, T: SchemaData> {
     publisher: Option<async_nats::Client>,
-    server: String,
+    servers: String,
     subject: String,
-    user: Option<String>,
-    password: Option<String>,
+    client_config: HashMap<String, String>,
     serializer: DataSerializer<T>,
     _t: PhantomData<K>,
 }
 
-impl <K: Key + Serialize, T: SchemaData> NatsSinkFunc<K, T> {
+impl<K: Key + Serialize, T: SchemaData> NatsSinkFunc<K, T> {
     pub fn from_config(config: &str) -> Self {
         let config: OperatorConfig =
             serde_json::from_str(config).expect("Invalid config for NatSinkFunc");
@@ -33,21 +37,25 @@ impl <K: Key + Serialize, T: SchemaData> NatsSinkFunc<K, T> {
         let format = config
             .format
             .expect("NATS source must have a format configured");
+        let connection: NatsConfig = serde_json::from_value(config.connection)
+            .expect("Invalid connection config for NatsSinkFunc");
+        let subject = match &table.connector_type {
+            ConnectorType::Source { .. } => panic!("NATS sink cannot be created from a source"),
+            ConnectorType::Sink { subject, .. } => subject.clone(),
+        };
         Self {
             publisher: None,
-            server: table.server,
-            subject: table.subject,
-            user: table.table_type.get_credentials("user"),
-            password: table.table_type.get_credentials("password"),
+            servers: connection.servers.clone(),
+            subject: subject.unwrap().clone(),
+            client_config: consumer_configs(&connection, &table),
             serializer: DataSerializer::new(format),
             _t: PhantomData,
         }
-    }   
+    }
 }
 
 #[process_fn(in_k = K, in_t = T)]
 impl<K: Key + Serialize, T: SchemaData> NatsSinkFunc<K, T> {
-
     fn name(&self) -> String {
         format!("nats-publisher-{}", self.subject)
     }
@@ -58,9 +66,17 @@ impl<K: Key + Serialize, T: SchemaData> NatsSinkFunc<K, T> {
 
     async fn get_nats_client(&mut self) -> Result<async_nats::Client> {
         info!("Creating NATS publisher for {:?}", self.subject);
+        let servers_vec: Vec<ServerAddr> = self
+            .servers
+            .split(',')
+            .map(|s| s.parse::<ServerAddr>().unwrap())
+            .collect();
         let nats_client: async_nats::Client = async_nats::ConnectOptions::new()
-            .user_and_password(self.user.clone().unwrap(), self.password.clone().unwrap())
-            .connect(self.server.clone())
+            .user_and_password(
+                self.client_config.get("nats.username").unwrap().to_string(),
+                self.client_config.get("nats.password").unwrap().to_string(),
+            )
+            .connect(servers_vec)
             .await
             .unwrap();
         Ok(nats_client)
@@ -83,7 +99,13 @@ impl<K: Key + Serialize, T: SchemaData> NatsSinkFunc<K, T> {
         let nats_subject = async_nats::Subject::from(self.subject.clone());
         let nats_message = serde_json::to_string(&record.value).unwrap();
 
-        match self.publisher.as_mut().unwrap().publish(nats_subject, nats_message.into()).await {
+        match self
+            .publisher
+            .as_mut()
+            .unwrap()
+            .publish(nats_subject, nats_message.into())
+            .await
+        {
             Ok(_) => {}
             Err(e) => {
                 ctx.control_tx

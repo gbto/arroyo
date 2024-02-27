@@ -2,101 +2,44 @@
     "type": "object",
     "title": "NatsTable",
     "properties": {
-        "server": {
-            "title": "Server",
-            "type": "string",
-            "description": "The NATS server that should receive the message",
-            "examples": [
-                "nats://localhost:4222"
-            ]
-        },
-        "stream": {
-            "title": "Stream",
-            "type": "string",
-            "description": "The stream of the NATS message",
-            "examples": [
-                "my-stream"
-            ]
-        },
-        "subject": {
-            "title": "Subject",
-            "type": "string",
-            "description": "The subject of the NATS message",
-            "examples": [
-                "my-subject"
-            ]
-        },
-        "table_type": {
-            "title": "Table Type",
+        "connectorType": {
             "type": "object",
+            "title": "Connector Type",
             "oneOf": [
                 {
                     "type": "object",
                     "title": "Source",
                     "properties": {
-                        "user": {
-                            "title": "User",
+                        "stream": {
                             "type": "string",
-                            "description": "Optional, the user for NATS server authentication",
-                            "examples": [
-                                "my-user"
-                            ]
-                        },
-                        "password": {
-                            "title": "Password",
-                            "type": "string",
-                            "description": "Optional, the password for NATS server authentication",
-                            "examples": [
-                                "my-password"
-                            ]
-                        },
-                        "token": {
-                            "title": "Token",
-                            "type": "string",
-                            "description": "Optional, the token for NATS server authentication",
-                            "examples": [
-                                "my-auth-token"
-                            ]
+                            "description": "The NATS Jetstream stream to consume from"
                         }
-                    }
+                    },
+                    "additionalProperties": false
                 },
                 {
                     "type": "object",
                     "title": "Sink",
                     "properties": {
-                        "user": {
-                            "title": "User",
+                        "subject": {
                             "type": "string",
-                            "description": "Optional, the user for NATS server authentication",
-                            "examples": [
-                                "my-user"
-                            ]
-                        },
-                        "password": {
-                            "title": "Password",
-                            "type": "string",
-                            "description": "Optional, the password for NATS server authentication",
-                            "examples": [
-                                "my-password"
-                            ]
-                        },
-                        "token": {
-                            "title": "Token",
-                            "type": "string",
-                            "description": "Optional, the token for NATS server authentication",
-                            "examples": [
-                                "my-auth-token"
-                            ]
+                            "description": "The NATS subject to publish to"
                         }
-                    }
+                    },
+                    "additionalProperties": false
                 }
             ]
+        },
+        "client_configs": {
+            "type": "object",
+            "title": "Client Configs",
+            "description": "Additional NATS configs to pass to the underlying NATS consumer or producer.",
+            "additionalProperties": {
+                "type": "string"
+            }
         }
     },
     "required": [
-        "server",
-        "stream",
-        "subject",
-        "table_type"
+        "connectorType"
     ]
 }

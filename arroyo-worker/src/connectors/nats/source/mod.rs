@@ -1,42 +1,46 @@
+use crate::engine::Context;
+use crate::{RateLimiter, SourceFinishType};
 use arroyo_formats::{DataDeserializer, SchemaData};
 use arroyo_macro::{source_fn, StreamNode};
-use arroyo_rpc::ControlMessage;
-use arroyo_rpc::ControlResp;
 use arroyo_rpc::formats::BadData;
 use arroyo_rpc::grpc::{StopMode, TableDescriptor};
+use arroyo_rpc::ControlMessage;
+use arroyo_rpc::ControlResp;
 use arroyo_rpc::OperatorConfig;
 use arroyo_state::tables::global_keyed_map::GlobalKeyedState;
 use arroyo_types::Data;
 use arroyo_types::UserError;
 use async_nats::jetstream::consumer;
+use async_nats::ServerAddr;
 use bincode::{Decode, Encode};
-use crate::{RateLimiter, SourceFinishType};
-use crate::engine::Context;
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime};
 use tokio::select;
 use tracing::debug;
 use tracing::info;
 
+use super::ConnectorType;
+use super::consumer_configs;
+use super::NatsConfig;
 use super::NatsTable;
 
-// TODO: Should generic types be more specific here?
 #[derive(StreamNode)]
 pub struct NatsSourceFunc<K, T>
 where
     K: DeserializeOwned + Data,
     T: SchemaData + Data,
 {
-    server: String,
-    stream_name: String,
-    user: Option<String>,
-    password: Option<String>,
+    stream: String,
+    servers: String,
     deserializer: DataDeserializer<T>,
     bad_data: Option<BadData>,
     rate_limiter: RateLimiter,
+    consumer_config: HashMap<String, String>,
+    messages_per_second: NonZeroU32,
     _t: PhantomData<(K, T)>,
 }
 
@@ -53,27 +57,42 @@ pub fn tables() -> Vec<TableDescriptor> {
 #[source_fn(out_k = (), out_t = T)]
 impl<K, T> NatsSourceFunc<K, T>
 where
-    K: DeserializeOwned + Data,
+    K: DeserializeOwned + Data + Send,
     T: SchemaData + Data,
 {
     pub fn from_config(config: &str) -> Self {
         let config: OperatorConfig =
             serde_json::from_str(config).expect("Invalid config for NatSourceFunc");
+        let connection: NatsConfig = serde_json::from_value(config.connection)
+            .expect("Invalid connection config for NatsSourceFunc");
         let table: NatsTable =
             serde_json::from_value(config.table).expect("Invalid table config for NatsSourceFunc");
         let format = config
             .format
             .expect("NATS source must have a format configured");
-        let framing = config.framing;
+        let framing = config
+            .framing;
+        let stream = match &table.connector_type {
+            ConnectorType::Source { ref stream, .. } => stream,
+            _ => panic!("NATS source must have a stream configured"),
+        };
+
+        let consumer_default_config = consumer_configs(&connection, &table);
 
         Self {
-            server: table.server,
-            stream_name: table.stream,
-            user: table.table_type.get_credentials("user"),
-            password: table.table_type.get_credentials("password"),
+            stream: stream.clone().unwrap(),
+            servers: connection.servers,
             deserializer: DataDeserializer::new(format, framing),
             bad_data: config.bad_data,
             rate_limiter: RateLimiter::new(),
+            consumer_config: consumer_default_config,
+            messages_per_second: NonZeroU32::new(
+                config
+                    .rate_limit
+                    .map(|l| l.messages_per_second)
+                    .unwrap_or(u32::MAX),
+            )
+            .unwrap(),
             _t: PhantomData,
         }
     }
@@ -90,9 +109,14 @@ where
         &mut self,
         stream_name: String,
     ) -> async_nats::jetstream::stream::Stream {
+        let servers_borrowed = &self.servers;
+        let servers_vec: Vec<ServerAddr> = servers_borrowed
+            .split(',')
+            .map(|s| s.parse().unwrap())
+            .collect();
         let client = async_nats::ConnectOptions::new()
-            .user_and_password(self.user.clone().unwrap(), self.password.clone().unwrap())
-            .connect(self.server.clone())
+            .user_and_password("user1".to_string(), "user1".to_string())
+            .connect(servers_vec)
             .await
             .unwrap();
 
@@ -164,8 +188,9 @@ where
             }
         };
         // Define the consumer configuration
+        // TODO: Replace by client_configs object built in module
         let consumer_config = consumer::pull::Config {
-            name: Some(self.stream_name.to_string()),
+            name: Some(self.consumer_config.get("nats.username").unwrap().clone()),
             ack_policy: consumer::AckPolicy::Explicit,
             replay_policy: consumer::ReplayPolicy::Instant,
             inactive_threshold: Duration::from_secs(60),
@@ -174,7 +199,10 @@ where
             deliver_policy,
             ..Default::default()
         };
-        match stream.delete_consumer(&self.stream_name).await {
+        match stream
+            .delete_consumer(&self.consumer_config.get("nats.username").unwrap().clone())
+            .await
+        {
             Ok(_) => {
                 info!("Existing consumer deleted. Recreating consumer with new `start_sequence`.")
             }
@@ -235,7 +263,8 @@ where
     }
 
     async fn run_int(&mut self, ctx: &mut Context<(), T>) -> Result<SourceFinishType, UserError> {
-        let stream = self.get_nats_stream(self.stream_name.to_string()).await;
+        // let config = &self.consumer_config;
+        let stream = self.get_nats_stream(self.stream.clone()).await;
         let consumer = self.get_nats_consumer(&stream, ctx).await;
 
         let mut sequence: HashMap<String, NatsSourceState> = HashMap::new();
@@ -253,37 +282,37 @@ where
 
                             let message_info = msg.info().unwrap();
 
-                            info!("---------------------------------------------->");
-                            debug!("Message format: {:?}", self.deserializer.get_format());
-                            debug!("Message payload: {:?}", message.as_ref().unwrap());
-                            info!(
-                                "Delivered stream sequence: {}",
-                                message_info.stream_sequence
-                            );
-                            info!(
-                                "Delivered consumer sequence: {}",
-                                message_info.consumer_sequence
-                            );
-                            info!(
-                                "Delivered message stream: {}",
-                                message_info.stream
-                            );
-                            info!(
-                                "Delivered message consumer: {}",
-                                message_info.consumer
-                            );
-                            info!(
-                                "Delivered message published: {}",
-                                message_info.published
-                            );
-                            info!(
-                                "Delivered message pending: {}",
-                                message_info.pending
-                            );
-                            info!(
-                                "Delivered message delivered: {}",
-                                message_info.delivered
-                            );
+                            // info!("---------------------------------------------->");
+                            // debug!("Message format: {:?}", self.deserializer.get_format());
+                            // debug!("Message payload: {:?}", message.as_ref().unwrap());
+                            // info!(
+                            //     "Delivered stream sequence: {}",
+                            //     message_info.stream_sequence
+                            // );
+                            // info!(
+                            //     "Delivered consumer sequence: {}",
+                            //     message_info.consumer_sequence
+                            // );
+                            // info!(
+                            //     "Delivered message stream: {}",
+                            //     message_info.stream
+                            // );
+                            // info!(
+                            //     "Delivered message consumer: {}",
+                            //     message_info.consumer
+                            // );
+                            // info!(
+                            //     "Delivered message published: {}",
+                            //     message_info.published
+                            // );
+                            // info!(
+                            //     "Delivered message pending: {}",
+                            //     message_info.pending
+                            // );
+                            // info!(
+                            //     "Delivered message delivered: {}",
+                            //     message_info.delivered
+                            // );
 
                             ctx.collect_source_record(
                                 timestamp,
@@ -307,7 +336,7 @@ where
                         },
                         None => {
                             break
-                            info!("Finished reading message from {}", &self.stream_name);
+                            info!("Finished reading message from {}", self.stream);
                         },
                     }
                 }
