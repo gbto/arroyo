@@ -6,10 +6,10 @@ use anyhow::Result;
 use arroyo_rpc::grpc::controller_grpc_server::{ControllerGrpc, ControllerGrpcServer};
 use arroyo_rpc::grpc::{
     GrpcOutputSubscription, HeartbeatNodeReq, HeartbeatNodeResp, HeartbeatReq, HeartbeatResp,
-    OutputData, RegisterNodeReq, RegisterNodeResp, RegisterWorkerReq, RegisterWorkerResp,
-    TaskCheckpointCompletedReq, TaskCheckpointCompletedResp, TaskFailedReq, TaskFailedResp,
-    TaskFinishedReq, TaskFinishedResp, TaskStartedReq, TaskStartedResp, WorkerFinishedReq,
-    WorkerFinishedResp,
+    JobMetricsReq, JobMetricsResp, OutputData, RegisterNodeReq, RegisterNodeResp,
+    RegisterWorkerReq, RegisterWorkerResp, TaskCheckpointCompletedReq, TaskCheckpointCompletedResp,
+    TaskFailedReq, TaskFailedResp, TaskFinishedReq, TaskFinishedResp, TaskStartedReq,
+    TaskStartedResp, WorkerFinishedReq, WorkerFinishedResp,
 };
 use arroyo_rpc::grpc::{
     SinkDataReq, SinkDataResp, TaskCheckpointEventReq, TaskCheckpointEventResp, WorkerErrorReq,
@@ -17,18 +17,21 @@ use arroyo_rpc::grpc::{
 };
 use arroyo_rpc::public_ids::{generate_id, IdTypes};
 use arroyo_server_common::shutdown::ShutdownGuard;
+use arroyo_server_common::wrap_start;
 use arroyo_types::{from_micros, grpc_port, ports, NodeId, WorkerId};
-use deadpool_postgres::Pool;
+use cornucopia_async::DatabaseSource;
 use lazy_static::lazy_static;
 use prometheus::{register_gauge, Gauge};
 use states::{Created, State, StateMachine};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use time::OffsetDateTime;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -40,6 +43,7 @@ mod states;
 
 include!(concat!(env!("OUT_DIR"), "/controller-sql.rs"));
 
+use crate::job_controller::job_metrics::JobMetrics;
 use crate::schedulers::{NodeScheduler, ProcessScheduler, Scheduler};
 use types::public::LogLevel;
 use types::public::{RestartMode, StopMode};
@@ -66,7 +70,7 @@ lazy_static! {
 
 #[derive(Eq, PartialEq, Clone, Debug)]
 pub struct JobConfig {
-    id: String,
+    id: Arc<String>,
     organization_id: String,
     pipeline_name: String,
     pipeline_id: i64,
@@ -80,7 +84,7 @@ pub struct JobConfig {
 
 #[derive(Clone, Debug)]
 pub struct JobStatus {
-    id: String,
+    id: Arc<String>,
     run_id: i64,
     state: String,
     start_time: Option<OffsetDateTime>,
@@ -94,25 +98,24 @@ pub struct JobStatus {
 }
 
 impl JobStatus {
-    pub async fn update_db(&self, pool: &Pool) -> Result<(), String> {
-        let c = pool.get().await.map_err(|e| format!("{:?}", e))?;
-        let res = queries::controller_queries::update_job_status()
-            .bind(
-                &c,
-                &self.state,
-                &self.start_time,
-                &self.finish_time,
-                &self.tasks,
-                &self.failure_message,
-                &self.restarts,
-                &self.pipeline_path,
-                &self.wasm_path,
-                &self.run_id,
-                &self.restart_nonce,
-                &self.id,
-            )
-            .await
-            .map_err(|e| format!("{:?}", e))?;
+    pub async fn update_db(&self, database: &DatabaseSource) -> Result<(), String> {
+        let c = database.client().await.map_err(|e| format!("{:?}", e))?;
+        let res = queries::controller_queries::execute_update_job_status(
+            &c,
+            &self.state,
+            &self.start_time,
+            &self.finish_time,
+            &self.tasks,
+            &self.failure_message,
+            &self.restarts,
+            &self.pipeline_path,
+            &self.wasm_path,
+            &self.run_id,
+            &self.restart_nonce,
+            &*self.id,
+        )
+        .await
+        .map_err(|e| format!("{:?}", e))?;
 
         if res == 0 {
             Err("Job status does not exist".to_string())
@@ -170,7 +173,8 @@ pub struct ControllerServer {
     job_state: Arc<tokio::sync::Mutex<HashMap<String, StateMachine>>>,
     data_txs: Arc<tokio::sync::Mutex<HashMap<String, Vec<Sender<Result<OutputData, Status>>>>>>,
     scheduler: Arc<dyn Scheduler>,
-    db: Pool,
+    metrics: Arc<RwLock<HashMap<Arc<String>, JobMetrics>>>,
+    db: DatabaseSource,
 }
 
 #[tonic::async_trait]
@@ -405,29 +409,45 @@ impl ControllerGrpc for ControllerServer {
     ) -> Result<Response<WorkerErrorRes>, Status> {
         info!("Got worker error.");
         let req = request.into_inner();
-        let client = self.db.get().await.unwrap();
-        match queries::controller_queries::create_job_log_message()
-            .bind(
-                &client,
-                &generate_id(IdTypes::JobLogMessage),
-                &req.job_id,
-                &req.operator_id,
-                &(req.task_index as i64),
-                &LogLevel::error,
-                &req.message,
-                &req.details,
-            )
-            .one()
-            .await
+        let client = self.db.client().await.unwrap();
+        match queries::controller_queries::execute_create_job_log_message(
+            &client,
+            &generate_id(IdTypes::JobLogMessage),
+            &req.job_id,
+            &req.operator_id,
+            &(req.task_index as i64),
+            &LogLevel::error,
+            &req.message,
+            &req.details,
+        )
+        .await
         {
             Ok(_) => Ok(Response::new(WorkerErrorRes {})),
             Err(err) => Err(Status::from_error(Box::new(err))),
         }
     }
+
+    async fn job_metrics(
+        &self,
+        request: Request<JobMetricsReq>,
+    ) -> Result<Response<JobMetricsResp>, Status> {
+        let job_id = request.into_inner().job_id;
+        let metrics = self
+            .metrics
+            .read()
+            .await
+            .get(&job_id)
+            .ok_or_else(|| Status::not_found("No metrics for job"))?
+            .clone();
+
+        Ok(Response::new(JobMetricsResp {
+            metrics: serde_json::to_string(&metrics.get_groups().await).unwrap(),
+        }))
+    }
 }
 
 impl ControllerServer {
-    pub async fn new(pool: Pool) -> Self {
+    pub async fn new(database: DatabaseSource) -> Self {
         let scheduler: Arc<dyn Scheduler> = match std::env::var("SCHEDULER").ok().as_deref() {
             Some("node") => {
                 info!("Using node scheduler");
@@ -451,7 +471,8 @@ impl ControllerServer {
             scheduler,
             data_txs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             job_state: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            db: pool,
+            db: database,
+            metrics: Default::default(),
         }
     }
 
@@ -480,21 +501,19 @@ impl ControllerServer {
         let db = self.db.clone();
         let jobs = Arc::clone(&self.job_state);
         let scheduler = Arc::clone(&self.scheduler);
+        let metrics = Arc::clone(&self.metrics);
 
         let token = guard.token();
 
         let our_guard = guard.child("update-thread");
         our_guard.into_spawn_task(async move {
             while !token.is_cancelled() {
-                let client = db.get().await.unwrap();
-                let res = queries::controller_queries::all_jobs()
-                    .bind(&client)
-                    .all()
-                    .await
-                    .unwrap();
+                let client = db.client().await?;
+                let res = queries::controller_queries::fetch_all_jobs(&client).await?;
                 for p in res {
+                    let id = Arc::new(p.id);
                     let config = JobConfig {
-                        id: p.id.clone(),
+                        id: id.clone(),
                         organization_id: p.org_id,
                         pipeline_name: p.pipeline_name,
                         pipeline_id: p.pipeline_id,
@@ -517,7 +536,7 @@ impl ControllerServer {
                     let mut jobs = jobs.lock().await;
 
                     let status = JobStatus {
-                        id: p.id,
+                        id: id.clone(),
                         run_id: p.run_id.unwrap_or(0),
                         state: p.state.unwrap_or_else(|| Created {}.name().to_string()),
                         start_time: p.start_time,
@@ -530,17 +549,18 @@ impl ControllerServer {
                         restart_nonce: p.status_restart_nonce,
                     };
 
-                    if let Some(sm) = jobs.get_mut(&config.id) {
+                    if let Some(sm) = jobs.get_mut(&*id) {
                         sm.update(config, status, &guard).await;
                     } else {
                         jobs.insert(
-                            config.id.clone(),
+                            (*id).clone(),
                             StateMachine::new(
                                 config,
                                 status,
                                 db.clone(),
                                 scheduler.clone(),
                                 guard.clone_temporary(),
+                                metrics.clone(),
                             )
                             .await,
                         );
@@ -549,6 +569,7 @@ impl ControllerServer {
 
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
+            Ok(())
         });
     }
 
@@ -558,7 +579,7 @@ impl ControllerServer {
             .build()
             .unwrap();
 
-        let addr = format!(
+        let addr: SocketAddr = format!(
             "0.0.0.0:{}",
             grpc_port("controller", ports::CONTROLLER_GRPC)
         )
@@ -568,12 +589,14 @@ impl ControllerServer {
         info!("Starting arroyo-controller on {}", addr);
 
         self.start_updater(guard.child("updater"));
-        guard.into_spawn_task(
+        guard.into_spawn_task(wrap_start(
+            "controller",
+            addr,
             arroyo_server_common::grpc_server()
                 .accept_http1(true)
                 .add_service(ControllerGrpcServer::new(self.clone()))
                 .add_service(reflection)
-                .serve(addr),
-        );
+                .serve(addr.clone()),
+        ));
     }
 }

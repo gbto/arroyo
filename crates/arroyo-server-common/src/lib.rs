@@ -2,6 +2,7 @@
 
 pub mod shutdown;
 
+use anyhow::anyhow;
 use arroyo_types::{admin_port, telemetry_enabled, POSTHOG_KEY};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -11,14 +12,13 @@ use axum::Router;
 use hyper::Body;
 use lazy_static::lazy_static;
 use once_cell::sync::OnceCell;
-use prometheus::{register_int_counter, IntCounter, TextEncoder};
-#[cfg(not(target_os = "freebsd"))]
-use pyroscope::{pyroscope::PyroscopeAgentRunning, PyroscopeAgent};
-#[cfg(not(target_os = "freebsd"))]
-use pyroscope_pprofrs::{pprof_backend, PprofConfig};
+use prometheus::{register_int_counter, Encoder, IntCounter, ProtobufEncoder, TextEncoder};
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::error::Error;
 use std::fs;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::body::BoxBody;
@@ -29,7 +29,7 @@ use tower_http::classify::{GrpcCode, GrpcErrorsAsFailures, SharedClassifier};
 use tower_http::trace::{DefaultOnFailure, TraceLayer};
 
 use tracing::metadata::LevelFilter;
-use tracing::{debug, info, span, warn, Level};
+use tracing::{debug, info, span, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
@@ -41,9 +41,6 @@ use tracing_log::LogTracer;
 pub const BUILD_TIMESTAMP: &str = env!("VERGEN_BUILD_TIMESTAMP");
 pub const GIT_SHA: &str = env!("VERGEN_GIT_SHA");
 pub const VERSION: &str = "0.11.0-dev";
-
-#[cfg(not(target_os = "freebsd"))]
-const PYROSCOPE_SERVER_ADDRESS_ENV: &str = "PYROSCOPE_SERVER_ADDRESS";
 
 static CLUSTER_ID: OnceCell<String> = OnceCell::new();
 
@@ -59,7 +56,8 @@ pub fn init_logging(name: &str) -> Option<WorkerGuard> {
         .with_filter(
             EnvFilter::builder()
                 .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
+                .from_env_lossy()
+                .add_directive("refinery_core=warn".parse().unwrap()),
         );
 
     let subscriber = Registry::default().with(stdout_log);
@@ -170,6 +168,17 @@ async fn metrics() -> Result<Bytes, StatusCode> {
     }
 }
 
+async fn metrics_proto() -> Result<Bytes, StatusCode> {
+    let encoder = ProtobufEncoder::new();
+    let registry = prometheus::default_registry();
+    let mut buf = vec![];
+    encoder
+        .encode(&registry.gather(), &mut buf)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(buf.into())
+}
+
 async fn details<'a>(State(state): State<Arc<AdminState>>) -> String {
     serde_json::to_string_pretty(&json!({
         "service": state.name,
@@ -180,7 +189,7 @@ async fn details<'a>(State(state): State<Arc<AdminState>>) -> String {
     .unwrap()
 }
 
-pub async fn start_admin_server(service: &str, default_port: u16) {
+pub async fn start_admin_server(service: &str, default_port: u16) -> anyhow::Result<()> {
     let port = admin_port(service, default_port);
 
     info!("Starting {} admin server on 0.0.0.0:{}", service, port);
@@ -192,6 +201,7 @@ pub async fn start_admin_server(service: &str, default_port: u16) {
         .route("/status", get(status))
         .route("/name", get(root))
         .route("/metrics", get(metrics))
+        .route("/metrics.pb", get(metrics_proto))
         .route("/details", get(details))
         .with_state(state);
 
@@ -200,61 +210,12 @@ pub async fn start_admin_server(service: &str, default_port: u16) {
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await
-        .expect("admin server failed");
-}
-
-#[cfg(not(target_os = "freebsd"))]
-pub fn try_profile_start(
-    application_name: impl ToString,
-    tags: Vec<(&str, &str)>,
-) -> Option<PyroscopeAgent<PyroscopeAgentRunning>> {
-    let agent = PyroscopeAgent::builder(
-        std::env::var(PYROSCOPE_SERVER_ADDRESS_ENV).ok()?,
-        application_name.to_string(),
-    )
-    .backend(pprof_backend(PprofConfig::new().sample_rate(100)))
-    .tags(tags)
-    .build();
-    let agent = match agent {
-        Ok(agent) => agent,
-        Err(err) => {
-            warn!("failed to build pyroscope agent with {}", err);
-            return None;
-        }
-    };
-    match agent.start() {
-        Ok(agent) => Some(agent),
-        Err(err) => {
-            warn!("failed to start pyroscope agent with {}", err);
-            None
-        }
-    }
-}
-
-struct TowerMetrics<S> {
-    inner: S,
+        .map_err(|e| anyhow!("Failed to start admin HTTP server: {}", e))
 }
 
 lazy_static! {
     static ref REQUEST_COUNTER: IntCounter =
         register_int_counter!("grpc_request_counter", "grpc requests").unwrap();
-}
-
-impl<S, Request> Service<Request> for TowerMetrics<S>
-where
-    S: Service<Request>,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: Request) -> Self::Future {
-        self.inner.call(req)
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -351,4 +312,21 @@ pub fn grpc_server() -> Server<
         .into_inner();
 
     Server::builder().layer(layer)
+}
+
+pub async fn wrap_start(
+    name: &str,
+    addr: SocketAddr,
+    result: impl Future<Output = Result<(), tonic::transport::Error>>,
+) -> anyhow::Result<()> {
+    result.await.map_err(|e| {
+        anyhow!(
+            "Failed to start {} server on {}: {}",
+            name,
+            addr,
+            e.source()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| e.to_string())
+        )
+    })
 }

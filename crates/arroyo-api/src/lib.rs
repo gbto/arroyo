@@ -1,12 +1,13 @@
+use anyhow::anyhow;
 use axum::response::IntoResponse;
 use axum::Json;
-use deadpool_postgres::Pool;
+use cornucopia_async::DatabaseSource;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::error::Error;
 use time::OffsetDateTime;
-use tokio_postgres::error::SqlState;
 use tonic::transport::Channel;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use utoipa::OpenApi;
 
 use crate::connection_profiles::{
@@ -25,19 +26,18 @@ use crate::jobs::{
 };
 use crate::metrics::__path_get_operator_metric_groups;
 use crate::pipelines::__path_get_pipelines;
-use crate::pipelines::__path_post_pipeline;
 use crate::pipelines::{
-    __path_delete_pipeline, __path_get_pipeline, __path_get_pipeline_jobs, __path_patch_pipeline,
-    __path_restart_pipeline, __path_validate_query,
+    __path_create_pipeline, __path_delete_pipeline, __path_get_pipeline, __path_get_pipeline_jobs,
+    __path_patch_pipeline, __path_restart_pipeline, __path_validate_query,
 };
 use crate::rest::__path_ping;
-use crate::rest_utils::{bad_request, log_and_map, service_unavailable, ErrorResp};
+use crate::rest_utils::{service_unavailable, ErrorResp};
 use crate::udfs::{__path_create_udf, __path_delete_udf, __path_get_udfs, __path_validate_udf};
 use arroyo_rpc::api_types::{checkpoints::*, connections::*, metrics::*, pipelines::*, udfs::*, *};
 use arroyo_rpc::formats::*;
 use arroyo_rpc::grpc::compiler_grpc_client::CompilerGrpcClient;
 use arroyo_types::{
-    default_controller_addr, ports, service_port, COMPILER_ADDR_ENV, COMPILER_PORT_ENV,
+    default_controller_addr, grpc_port, ports, service_port, COMPILER_ADDR_ENV,
     CONTROLLER_ADDR_ENV, HTTP_PORT_ENV,
 };
 
@@ -50,6 +50,7 @@ mod metrics;
 mod pipelines;
 pub mod rest;
 mod rest_utils;
+pub mod sql;
 mod udfs;
 
 include!(concat!(env!("OUT_DIR"), "/api-sql.rs"));
@@ -105,31 +106,6 @@ pub struct AuthData {
     pub org_metadata: OrgMetadata,
 }
 
-fn handle_db_error(name: &str, err: tokio_postgres::Error) -> ErrorResp {
-    if let Some(db) = &err.as_db_error() {
-        if *db.code() == SqlState::UNIQUE_VIOLATION {
-            // TODO improve error message
-            warn!("SQL error: {}", db.message());
-            return bad_request(format!("A {} with that name already exists", name));
-        }
-    }
-
-    log_and_map(err)
-}
-
-fn handle_delete(name: &str, users: &str, err: tokio_postgres::Error) -> ErrorResp {
-    if let Some(db) = &err.as_db_error() {
-        if *db.code() == SqlState::FOREIGN_KEY_VIOLATION {
-            return bad_request(format!(
-                "Cannot delete {}; it is still being used by {}",
-                name, users
-            ));
-        }
-    }
-
-    log_and_map(err)
-}
-
 pub(crate) fn to_micros(dt: OffsetDateTime) -> u64 {
     (dt.unix_timestamp_nanos() / 1_000) as u64
 }
@@ -138,7 +114,7 @@ pub async fn compiler_service() -> Result<CompilerGrpcClient<Channel>, ErrorResp
     let compiler_addr = std::env::var(COMPILER_ADDR_ENV).unwrap_or_else(|_| {
         format!(
             "http://localhost:{}",
-            service_port("compiler", ports::COMPILER_GRPC, COMPILER_PORT_ENV)
+            grpc_port("compiler", ports::COMPILER_GRPC)
         )
     });
 
@@ -151,20 +127,28 @@ pub async fn compiler_service() -> Result<CompilerGrpcClient<Channel>, ErrorResp
         })
 }
 
-pub async fn start_server(pool: Pool) {
+pub async fn start_server(database: DatabaseSource) -> anyhow::Result<()> {
     let controller_addr =
         std::env::var(CONTROLLER_ADDR_ENV).unwrap_or_else(|_| default_controller_addr());
 
     let http_port = service_port("api", ports::API_HTTP, HTTP_PORT_ENV);
     let addr = format!("0.0.0.0:{}", http_port).parse().unwrap();
 
-    let app = rest::create_rest_app(pool, &controller_addr);
+    let app = rest::create_rest_app(database, &controller_addr);
 
     info!("Starting API server on {:?}", addr);
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await
-        .expect("HTTP server failed");
+        .map_err(|e| {
+            anyhow!(
+                "Failed to start API server on {}: {}",
+                addr,
+                e.source()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| e.to_string())
+            )
+        })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -237,7 +221,7 @@ impl IntoResponse for HttpError {
         ping,
         validate_query,
         validate_udf,
-        post_pipeline,
+        create_pipeline,
         patch_pipeline,
         restart_pipeline,
         get_pipeline,
@@ -266,6 +250,7 @@ impl IntoResponse for HttpError {
         delete_udf
     ),
     components(schemas(
+        ErrorResp,
         PipelinePost,
         PipelinePatch,
         PipelineRestart,
@@ -283,7 +268,7 @@ impl IntoResponse for HttpError {
         Checkpoint,
         CheckpointCollection,
         OutputData,
-        MetricNames,
+        MetricName,
         Metric,
         SubtaskMetrics,
         MetricGroup,
@@ -311,6 +296,7 @@ impl IntoResponse for HttpError {
         AvroFormat,
         ParquetFormat,
         RawStringFormat,
+        RawBytesFormat,
         TimestampFormat,
         Framing,
         FramingMethod,

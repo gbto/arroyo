@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use std::{fmt::Debug, sync::Arc};
@@ -5,7 +6,6 @@ use std::{fmt::Debug, sync::Arc};
 use arroyo_rpc::grpc::api::ArrowProgram;
 
 use arroyo_server_common::log_event;
-use deadpool_postgres::Pool;
 use serde_json::json;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -14,6 +14,7 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tracing::{error, info, warn};
 
 use anyhow::{anyhow, Result};
+use cornucopia_async::DatabaseSource;
 
 use crate::job_controller::JobController;
 use crate::queries::controller_queries;
@@ -93,7 +94,7 @@ async fn handle_terminal<'a>(ctx: &mut JobContext<'a>) {
         warn!(
             message = "Failed to clean up cluster",
             error = format!("{:?}", e),
-            job_id = ctx.config.id
+            job_id = *ctx.config.id
         );
     }
 }
@@ -345,6 +346,7 @@ macro_rules! stop_if_desired_non_running {
     };
 }
 
+use crate::job_controller::job_metrics::JobMetrics;
 use crate::states::restarting::Restarting;
 pub(crate) use stop_if_desired_non_running;
 pub(crate) use stop_if_desired_running;
@@ -353,12 +355,13 @@ pub struct JobContext<'a> {
     config: JobConfig,
     status: &'a mut JobStatus,
     program: &'a mut LogicalProgram,
-    pool: Pool,
+    db: DatabaseSource,
     scheduler: Arc<dyn Scheduler>,
     rx: &'a mut Receiver<JobMessage>,
     retries_attempted: usize,
     job_controller: Option<JobController>,
     last_transitioned_at: Instant,
+    metrics: Arc<tokio::sync::RwLock<HashMap<Arc<String>, JobMetrics>>>,
 }
 
 impl<'a> JobContext<'a> {
@@ -387,6 +390,7 @@ impl<'a> JobContext<'a> {
 pub trait State: Sync + Send + 'static + Debug {
     fn name(&self) -> &'static str;
 
+    #[allow(unused)]
     fn is_terminal(&self) -> bool {
         false
     }
@@ -430,7 +434,7 @@ async fn execute_state<'a>(
         Ok(Transition::Advance(s)) => {
             info!(
                 message = "state transition",
-                job_id = ctx.config.id,
+                job_id = *ctx.config.id,
                 from = state_name,
                 to = s.state.name(),
                 duration_ms = ctx.last_transitioned_at.elapsed().as_millis()
@@ -470,7 +474,7 @@ async fn execute_state<'a>(
         }) => {
             error!(
                 message = "fatal state error",
-                job_id = ctx.config.id,
+                job_id = *ctx.config.id,
                 state = state_name,
                 error_message = message,
                 error = format!("{:?}", source)
@@ -499,7 +503,7 @@ async fn execute_state<'a>(
         }) => {
             error!(
                 message = "retryable state error",
-                job_id = ctx.config.id,
+                job_id = *ctx.config.id,
                 state = state_name,
                 error_message = message,
                 error = format!("{:?}", source),
@@ -527,7 +531,7 @@ async fn execute_state<'a>(
         ctx.status.state = s.name().to_string();
 
         ctx.status
-            .update_db(&ctx.pool)
+            .update_db(&ctx.db)
             .await
             .expect("Failed to update status");
     }
@@ -540,20 +544,22 @@ pub async fn run_to_completion(
     mut program: LogicalProgram,
     mut status: JobStatus,
     mut state: Box<dyn State>,
-    pool: Pool,
+    db: DatabaseSource,
     mut rx: Receiver<JobMessage>,
     scheduler: Arc<dyn Scheduler>,
+    metrics: Arc<tokio::sync::RwLock<HashMap<Arc<String>, JobMetrics>>>,
 ) {
     let mut ctx = JobContext {
         config: config.read().unwrap().clone(),
         status: &mut status,
         program: &mut program,
-        pool: pool.clone(),
+        db: db.clone(),
         scheduler,
         rx: &mut rx,
         retries_attempted: 0,
         job_controller: None,
         last_transitioned_at: Instant::now(),
+        metrics,
     };
 
     loop {
@@ -571,8 +577,9 @@ pub async fn run_to_completion(
 
 pub struct StateMachine {
     tx: Option<Sender<JobMessage>>,
-    config: Arc<RwLock<JobConfig>>,
-    pool: Pool,
+    pub config: Arc<RwLock<JobConfig>>,
+    metrics: Arc<tokio::sync::RwLock<HashMap<Arc<String>, JobMetrics>>>,
+    db: DatabaseSource,
     scheduler: Arc<dyn Scheduler>,
 }
 
@@ -580,14 +587,16 @@ impl StateMachine {
     pub async fn new(
         config: JobConfig,
         status: JobStatus,
-        pool: Pool,
+        db: DatabaseSource,
         scheduler: Arc<dyn Scheduler>,
         shutdown_guard: ShutdownGuard,
+        metrics: Arc<tokio::sync::RwLock<HashMap<Arc<String>, JobMetrics>>>,
     ) -> Self {
         let mut this = Self {
             tx: None,
             config: Arc::new(RwLock::new(config)),
-            pool,
+            metrics,
+            db,
             scheduler,
         };
 
@@ -604,16 +613,16 @@ impl StateMachine {
     }
 
     async fn get_program(
-        pool: &Pool,
+        db: &DatabaseSource,
         job_id: &str,
         id: i64,
     ) -> anyhow::Result<Option<LogicalProgram>> {
-        let c = pool.get().await?;
-        let res = controller_queries::get_program()
-            .bind(&c, &id)
-            .one()
+        let res = controller_queries::fetch_get_program(&db.client().await?, &id)
             .await
-            .map_err(|e| anyhow!("Failed to fetch program from database: {:?}", e))?;
+            .map_err(|e| anyhow!("Failed to fetch program from database: {:?}", e))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Could not find program for job_id {job_id}"))?;
 
         Ok(if res.proto_version == 2 {
             match Self::decode_program(&res.program) {
@@ -663,30 +672,32 @@ impl StateMachine {
 
         if let Some(initial_state) = initial_state {
             status.state = initial_state.name().to_string();
-            status.update_db(&self.pool).await.unwrap();
+            status.update_db(&self.db).await.unwrap();
             let (tx, rx) = channel(1024);
             {
                 let config = self.config.clone();
-                let pool = self.pool.clone();
+                let db = self.db.clone();
                 let scheduler = self.scheduler.clone();
-
+                let metrics = self.metrics.clone();
                 let pipeline_id = config.read().unwrap().pipeline_id;
-                match Self::get_program(&pool, &status.id, pipeline_id).await {
+                match Self::get_program(&db, &status.id, pipeline_id).await {
                     Ok(Some(program)) => {
                         shutdown_guard.into_spawn_task(async move {
                             let id = { config.read().unwrap().id.clone() };
-                            info!(message = "starting state machine", job_id = id);
+                            info!(message = "starting state machine", job_id = *id);
                             run_to_completion(
                                 config,
                                 program,
                                 status,
                                 initial_state,
-                                pool,
+                                db,
                                 rx,
                                 scheduler,
+                                metrics,
                             )
                             .await;
-                            info!(message = "finished state machine", job_id = id);
+                            info!(message = "finished state machine", job_id = *id);
+                            Ok(())
                         });
                     }
                     Ok(None) => {

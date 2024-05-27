@@ -3,6 +3,7 @@ use base64::prelude::BASE64_STANDARD_NO_PAD;
 use base64::Engine;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 use std::process::Stdio;
 use std::str::from_utf8;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,6 +15,7 @@ use arroyo_rpc::grpc::{
 };
 use arroyo_rpc::var_str::VarStr;
 
+use arroyo_server_common::wrap_start;
 use arroyo_storage::StorageProvider;
 use arroyo_types::{
     bool_config, grpc_port, ports, ARTIFACT_URL_DEFAULT, ARTIFACT_URL_ENV, INSTALL_CLANG_ENV,
@@ -41,16 +43,18 @@ pub async fn start_service() -> anyhow::Result<()> {
     let service = CompileService::new().await?;
     let grpc = grpc_port("compiler", ports::COMPILER_GRPC);
 
-    let addr = format!("0.0.0.0:{}", grpc).parse().unwrap();
+    let addr: SocketAddr = format!("0.0.0.0:{}", grpc).parse().unwrap();
 
     info!("Starting compiler service at {}", addr);
 
-    arroyo_server_common::grpc_server()
-        .add_service(CompilerGrpcServer::new(service))
-        .serve(addr)
-        .await?;
-
-    Ok(())
+    wrap_start(
+        "compiler service",
+        addr.clone(),
+        arroyo_server_common::grpc_server()
+            .add_service(CompilerGrpcServer::new(service))
+            .serve(addr),
+    )
+    .await
 }
 
 pub struct CompileService {
@@ -168,6 +172,35 @@ impl CompileService {
         }
     }
 
+    async fn run_command(action: &str, command: &mut Command) -> anyhow::Result<()> {
+        let output = timeout(
+            Duration::from_secs(2 * 60),
+            command
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .output(),
+        )
+        .await
+        .map_err(|e| anyhow!("Timed out while {action} for UDF compilation after {e}"))?
+        .map_err(|e| anyhow!("Failed while {action} via apt-get: {e}"))?;
+
+        if !output.status.success() {
+            error!(
+                "Failed to install clang, will not be able to compile UDFs\
+            \n------------------------------\
+            \napt-get stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            bail!(
+                "UDFs are unavailable because a C compiler is not installed and was not able to \
+            be installed. See controller logs for details."
+            );
+        }
+
+        Ok(())
+    }
+
     async fn check_cc(&self) -> anyhow::Result<()> {
         if binary_present("cc").await {
             return Ok(());
@@ -183,35 +216,17 @@ impl CompileService {
         info!(
             "cc is not available, but required for UDF compilation. Attempting to install clang."
         );
-        let output = timeout(
-            Duration::from_secs(2 * 60),
+
+        Self::run_command("updating apt", Command::new("apt-get").arg("update")).await?;
+
+        Self::run_command(
+            "installing clang",
             Command::new("apt-get")
                 .arg("-y")
                 .arg("install")
-                .arg("clang")
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .output(),
+                .arg("clang"),
         )
-        .await
-        .map_err(|e| anyhow!("Timed out while installing clang for UDF compilation after {e}"))?
-        .map_err(|e| anyhow!("Failed to install clang via apt-get: {e}"))?;
-
-        if output.status.success() {
-            info!("clang successfully installed...");
-        } else {
-            error!(
-                "Failed to install clang, will not be able to compile UDFs\
-            \n------------------------------\
-            \napt-get stderr: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-
-            bail!(
-                "UDFs are unavailable because a C compiler is not installed and was not able to \
-            be installed. See controller logs for details."
-            );
-        }
+        .await?;
 
         Ok(())
     }

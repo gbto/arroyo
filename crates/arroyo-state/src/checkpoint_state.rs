@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet},
     time::SystemTime,
@@ -25,8 +26,8 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct CheckpointState {
-    job_id: String,
-    checkpoint_id: i64,
+    job_id: Arc<String>,
+    checkpoint_id: String,
     epoch: u32,
     min_epoch: u32,
     start_time: SystemTime,
@@ -144,8 +145,8 @@ impl TableState {
 
 impl CheckpointState {
     pub fn new(
-        job_id: String,
-        checkpoint_id: i64,
+        job_id: Arc<String>,
+        checkpoint_id: String,
         epoch: u32,
         min_epoch: u32,
         tasks_per_operator: HashMap<String, usize>,
@@ -168,8 +169,8 @@ impl CheckpointState {
         }
     }
 
-    pub fn checkpoint_id(&self) -> i64 {
-        self.checkpoint_id
+    pub fn checkpoint_id(&self) -> &str {
+        &self.checkpoint_id
     }
 
     pub fn start_time(&self) -> SystemTime {
@@ -230,8 +231,15 @@ impl CheckpointState {
     }
 
     pub async fn checkpoint_finished(&mut self, c: TaskCheckpointCompletedReq) -> Result<()> {
-        debug!(message = "Checkpoint finished", checkpoint_id = self.checkpoint_id, job_id = self.job_id, 
-        epoch = self.epoch, min_epoch = self.min_epoch, operator_id = %c.operator_id, subtask_index = c.metadata.as_ref().unwrap().subtask_index, time = c.time);
+        debug!(
+            message = "Checkpoint finished", 
+            checkpoint_id = self.checkpoint_id,
+            job_id = *self.job_id,
+            epoch = self.epoch,
+            min_epoch = self.min_epoch,
+            operator_id = %c.operator_id,
+            subtask_index = c.metadata.as_ref().unwrap().subtask_index,
+            time = c.time);
         // TODO: UI management
         let metadata = c
             .metadata
@@ -340,7 +348,7 @@ impl CheckpointState {
 
     pub fn committing_state(&self) -> CommittingState {
         CommittingState::new(
-            self.checkpoint_id,
+            self.checkpoint_id.clone(),
             self.subtasks_to_commit.clone(),
             self.commit_data.clone(),
         )
@@ -349,7 +357,7 @@ impl CheckpointState {
     pub async fn save_state(&self) -> Result<()> {
         let finish_time = SystemTime::now();
         StateBackend::write_checkpoint_metadata(CheckpointMetadata {
-            job_id: self.job_id.clone(),
+            job_id: self.job_id.to_string(),
             epoch: self.epoch,
             min_epoch: self.min_epoch,
             start_time: to_micros(self.start_time),

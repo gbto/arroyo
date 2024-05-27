@@ -62,7 +62,8 @@ impl State for Running {
                                 }));
                             }
 
-                            let job_controller = ctx.job_controller.as_ref().unwrap();
+                            let job_controller = ctx.job_controller.as_mut().unwrap();
+
                             for (op, p) in &c.parallelism_overrides {
                                 if let Some(actual) = job_controller.operator_parallelism(op){
                                     if actual != *p {
@@ -73,6 +74,8 @@ impl State for Running {
                                     }
                                 }
                             }
+
+                            job_controller.update_config(c);
                         }
                         Some(JobMessage::RunningMessage(msg)) => {
                             if let Err(e) = ctx.job_controller.as_mut().unwrap().handle_message(msg).await {
@@ -91,9 +94,9 @@ impl State for Running {
                     if ctx.status.restarts > 0 && running_start.elapsed() > HEALTHY_DURATION {
                         let restarts = ctx.status.restarts;
                         ctx.status.restarts = 0;
-                        if let Err(e) = ctx.status.update_db(&ctx.pool).await {
+                        if let Err(e) = ctx.status.update_db(&ctx.db).await {
                             error!(message = "Failed to update status", error = format!("{:?}", e),
-                                job_id = ctx.config.id);
+                                job_id = *ctx.config.id);
                             ctx.status.restarts = restarts;
                             // we'll try again on the next round
                         }
@@ -110,7 +113,7 @@ impl State for Running {
                             ))
                         },
                         Err(err) => {
-                            error!(message = "error while running", error = format!("{:?}", err), job_id = ctx.config.id);
+                            error!(message = "error while running", error = format!("{:?}", err), job_id = *ctx.config.id);
                             log_event("running_error", json!({
                                 "service": "controller",
                                 "job_id": ctx.config.id,
