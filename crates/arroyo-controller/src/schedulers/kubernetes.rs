@@ -5,7 +5,7 @@ use arroyo_types::{
     string_config, u32_config, WorkerId, ADMIN_PORT_ENV, ARROYO_PROGRAM_ENV, CONTROLLER_ADDR_ENV,
     GRPC_PORT_ENV, JOB_ID_ENV, K8S_NAMESPACE_ENV, K8S_WORKER_ANNOTATIONS_ENV,
     K8S_WORKER_CONFIG_MAP_ENV, K8S_WORKER_IMAGE_ENV, K8S_WORKER_IMAGE_PULL_POLICY_ENV,
-    K8S_WORKER_LABELS_ENV, K8S_WORKER_NAME_ENV, K8S_WORKER_RESOURCES_ENV,
+    K8S_WORKER_LABELS_ENV, K8S_WORKER_NAME_ENV, K8S_WORKER_RESOURCES_ENV, K8S_WORKER_NODE_SELECTOR_ENV,
     K8S_WORKER_SERVICE_ACCOUNT_NAME_ENV, K8S_WORKER_SLOTS_ENV, K8S_WORKER_VOLUMES_ENV,
     K8S_WORKER_VOLUME_MOUNTS_ENV, NODE_ID_ENV, RUN_ID_ENV, TASK_SLOTS_ENV,
 };
@@ -38,6 +38,7 @@ pub struct KubernetesScheduler {
     image_pull_policy: String,
     service_account_name: String,
     resources: ResourceRequirements,
+    node_selector: String,
     slots_per_pod: u32,
     volumes: Vec<Volume>,
     volume_mounts: Vec<VolumeMount>,
@@ -85,6 +86,7 @@ impl KubernetesScheduler {
                     ),
                 },
             ),
+            node_selector: string_config(K8S_WORKER_NODE_SELECTOR_ENV, "dedicated:arroyo"),
             slots_per_pod: u32_config(K8S_WORKER_SLOTS_ENV, 4),
             volumes: yaml_config(K8S_WORKER_VOLUMES_ENV, vec![]),
             volume_mounts: yaml_config(K8S_WORKER_VOLUME_MOUNTS_ENV, vec![]),
@@ -216,6 +218,9 @@ impl KubernetesScheduler {
                             }
                         ],
                         "serviceAccountName": self.service_account_name,
+                        "nodeSelector": [
+                            self.node_selector
+                        ]
                     }
                 }
             }
