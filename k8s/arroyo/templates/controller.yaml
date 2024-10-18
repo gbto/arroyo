@@ -94,6 +94,10 @@ spec:
           value: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}"
         - name: K8S_WORKER_IMAGE_PULL_POLICY
           value: "{{ .Values.worker.image.pullPolicy }}"
+        {{- if .Values.worker.nodeSelector }}
+        - name: K8S_WORKER_NODE_SELECTOR
+          value: "{{ .Values.worker.nodeSelector }}"
+        {{- end }}
         # TODO: image pull secret
         {{- if .Values.serviceAccount.name }}
         - name: K8S_WORKER_SERVICE_ACCOUNT_NAME
